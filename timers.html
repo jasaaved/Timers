@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Asynchronous Turn Timers (Phone)</title>
+<style>
+  :root { --fg:#111; --muted:#777; --bg:#f7f7f7; --accent:#0a84ff; --paused:#e6e6e6; --barbg:#eee; }
+  html,body { height: 100%; }
+  body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background: var(--bg); color: var(--fg); margin: 0; }
+  .wrap { max-width: 560px; margin: 0 auto; padding: 16px 16px 64px; }
+  h1 { font-size: 20px; margin: 8px 0 12px; }
+  .card { padding: 12px 14px; background: #fff; border-radius: 14px; margin: 12px 0; box-shadow: 0 1px 3px rgba(0,0,0,.06); }
+  .row { display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: center; }
+  .label { font-weight: 800; }
+  .sublabel { color: var(--muted); font-size: 12px; }
+  .time { font-variant-numeric: tabular-nums; font-size: 20px; }
+  .muted { color: var(--muted); font-size: 13px; }
+  .btns { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+  button { -webkit-tap-highlight-color: transparent; appearance: none; border: 0; border-radius: 999px; padding: 10px 14px; font-weight: 700; font-size: 15px; }
+  .primary { background: var(--accent); color: #fff; }
+  .ghost { background: #fff; color: var(--fg); border: 1px solid #ddd; }
+  .danger { background: #e64a19; color: #fff; }
+  .small { font-size: 13px; padding: 8px 12px; }
+  .badge { display: inline-block; padding: 4px 8px; border-radius: 999px; background: #eee; font-size: 12px; font-weight: 800; letter-spacing: .02em; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+
+  /* Progress bars */
+  .barwrap { margin-top: 8px; }
+  .bar { position: relative; height: 14px; background: var(--barbg); border-radius: 999px; overflow: hidden; }
+  .fill { position: absolute; inset: 0; width: 0%; background: linear-gradient(90deg, var(--accent), #6aa9ff); transition: width .05s linear; }
+  .bar.ready .fill, .bar.active .fill { background: linear-gradient(90deg, #22c55e, #16a34a); } /* green when ready/active */
+  .paused .fill { background: var(--paused); }
+  .barlabel { display: none; }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>My Timers</h1>
+
+    <div class="card">
+      <div class="muted">Current phase</div>
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+        <div id="phase" class="badge" aria-live="polite">Idle</div>
+        <div id="hint" class="muted"></div>
+      </div>
+      <div class="btns">
+        <button id="start" class="primary">Start</button>
+        <button id="endPhase" class="ghost" style="display:none;">End Phase</button>
+        <button id="reset" class="danger small">Reset All</button>
+      </div>
+    </div>
+
+    <div class="card" role="group" aria-label="Draw timer">
+      <div class="row">
+        <div>
+          <div class="label">Draw</div>
+          <div class="sublabel">fills to 0 → starts Draw phase</div>
+        </div>
+        <div class="time" id="drawTime">14.0s</div>
+      </div>
+      <div class="barwrap">
+        <div id="barDraw" class="bar"><div class="fill"></div></div>
+        <div class="barlabel"><span>0%</span><span id="pctDraw">0%</span></div>
+      </div>
+    </div>
+
+    <div class="card" role="group" aria-label="Action timer">
+      <div class="row">
+        <div>
+          <div class="label">Action</div>
+          <div class="sublabel">fills to 0 → starts Action phase</div>
+        </div>
+        <div class="time" id="actionTime">6.0s</div>
+      </div>
+      <div class="barwrap">
+        <div id="barAction" class="bar"><div class="fill"></div></div>
+        <div class="barlabel"><span>0%</span><span id="pctAction">0%</span></div>
+      </div>
+    </div>
+
+    <div class="card" role="group" aria-label="Combat timer">
+      <div class="row">
+        <div>
+          <div class="label">Combat</div>
+          <div class="sublabel">fills to 0 → starts Combat phase</div>
+        </div>
+        <div class="time" id="combatTime">10.0s</div>
+      </div>
+      <div class="barwrap">
+        <div id="barCombat" class="bar"><div class="fill"></div></div>
+        <div class="barlabel"><span>0%</span><span id="pctCombat">0%</span></div>
+      </div>
+    </div>
+
+    <p class="muted" style="margin-top:8px;">
+      Trigger priority when multiple hit 0 at once: <strong>Draw → Action → Combat</strong>.
+    </p>
+  </div>
+
+<script>
+(() => {
+  // === Config (seconds) ===
+  const DUR = { Draw: 14, Action: 6, Combat: 10 };
+
+  // Use millisecond resolution for buttery-smooth fills, but keep logic in seconds (phase triggers at 0).
+  const toMs = (s) => Math.round(s * 1000);
+  const durMs = { Draw: toMs(DUR.Draw), Action: toMs(DUR.Action), Combat: toMs(DUR.Combat) };
+  const END_EPS_MS = 100; // treat anything within 0.1s of 0 as ended for triggers
+
+  // === State ===
+  let remMs = { Draw: durMs.Draw, Action: durMs.Action, Combat: durMs.Combat };
+  let activePhase = null; // 'Draw' | 'Action' | 'Combat' | null
+  let ticking = false;
+
+  // === DOM ===
+  const el = {
+    phase: document.getElementById('phase'),
+    hint: document.getElementById('hint'),
+    start: document.getElementById('start'),
+    end: document.getElementById('endPhase'),
+    reset: document.getElementById('reset'),
+    barDraw: document.getElementById('barDraw'),
+    barAction: document.getElementById('barAction'),
+    barCombat: document.getElementById('barCombat'),
+    // seconds-only labels
+    drawTime: document.getElementById('drawTime'),
+    actionTime: document.getElementById('actionTime'),
+    combatTime: document.getElementById('combatTime')
+  };
+
+  function setBar(elBar, pct, opts = {}) {
+    const { paused = false, ready = false, active = false } = opts;
+    const fill = elBar.querySelector('.fill');
+    fill.style.width = pct + '%';
+    // reset state classes
+    elBar.classList.remove('paused','ready','active');
+    if (paused) elBar.classList.add('paused');
+    if (ready)  elBar.classList.add('ready');
+    if (active) elBar.classList.add('active');
+  }
+
+  function updateUI() {
+    // Seconds-only display (ceil so it never shows 0s until it actually hits 0)
+    const sDraw   = Math.max(0, Math.ceil(remMs.Draw   / 1000));
+    const sAction = Math.max(0, Math.ceil(remMs.Action / 1000));
+    const sCombat = Math.max(0, Math.ceil(remMs.Combat / 1000));
+    el.drawTime.textContent   = sDraw   + 's';
+    el.actionTime.textContent = sAction + 's';
+    el.combatTime.textContent = sCombat + 's';
+    el.phase.textContent = activePhase ? activePhase : 'Idle';
+    el.end.style.display = activePhase ? '' : 'none';
+    el.hint.textContent  = activePhase ? '(tap “End Phase” to resume timers)' : '';
+
+    const pDraw   = Math.round((1 - remMs.Draw   / durMs.Draw)   * 100);
+    const pAction = Math.round((1 - remMs.Action / durMs.Action) * 100);
+    const pCombat = Math.round((1 - remMs.Combat / durMs.Combat) * 100);
+
+    setBar(el.barDraw, pDraw, {
+      paused: activePhase !== null && activePhase !== 'Draw',
+      ready:  activePhase === null && remMs.Draw <= END_EPS_MS,
+      active: activePhase === 'Draw'
+    });
+    setBar(el.barAction, pAction, {
+      paused: activePhase !== null && activePhase !== 'Action',
+      ready:  activePhase === null && remMs.Action <= END_EPS_MS,
+      active: activePhase === 'Action'
+    });
+    setBar(el.barCombat, pCombat, {
+      paused: activePhase !== null && activePhase !== 'Combat',
+      ready:  activePhase === null && remMs.Combat <= END_EPS_MS,
+      active: activePhase === 'Combat'
+    });
+  }
+
+  // High-res ticking via rAF
+  let rafId = null, lastT = null;
+  function loop(t) {
+    if (!ticking) { lastT = t; rafId = requestAnimationFrame(loop); return; }
+    if (lastT == null) lastT = t;
+    const dtMs = Math.min(250, t - lastT); // clamp long gaps to 250ms
+    lastT = t;
+
+    if (activePhase === null) {
+      // Idle: all three countdowns run together in ms
+      remMs.Draw   = Math.max(0, remMs.Draw   - dtMs);
+      remMs.Action = Math.max(0, remMs.Action - dtMs);
+      remMs.Combat = Math.max(0, remMs.Combat - dtMs);
+
+      // Snap tiny negatives and apply deterministic priority Draw > Action > Combat
+      const readyDraw   = remMs.Draw   <= END_EPS_MS;
+      const readyAction = remMs.Action <= END_EPS_MS;
+      const readyCombat = remMs.Combat <= END_EPS_MS;
+
+      if (readyDraw) {
+        remMs.Draw = 0; // snap to exact zero for determinism
+        startPhase('Draw');
+      } else if (readyAction) {
+        remMs.Action = 0;
+        startPhase('Action');
+      } else if (readyCombat) {
+        remMs.Combat = 0;
+        startPhase('Combat');
+      }
+    }
+
+    updateUI();
+    rafId = requestAnimationFrame(loop);
+  }
+
+  // Controls
+  function start() {
+    if (!ticking) ticking = true;
+    el.start.disabled = true; // disable start after first press
+  }
+  function pause() { ticking = false; }
+
+  function startPhase(name) {
+    if (activePhase) return;
+    activePhase = name;
+    if (navigator.vibrate) { try { navigator.vibrate(10); } catch (e) {} }
+  }
+
+  function endPhase() {
+    if (!activePhase) return;
+    // Reset the phase that triggered to full duration
+    remMs[activePhase] = durMs[activePhase];
+    activePhase = null;
+  }
+
+  function resetAll() {
+    activePhase = null;
+    remMs = { Draw: durMs.Draw, Action: durMs.Action, Combat: durMs.Combat };
+    updateUI();
+    el.start.disabled = false;
+    ticking = false;
+  }
+
+  // Wire buttons
+  el.start.addEventListener('click', start);
+  el.end.addEventListener('click', endPhase);
+  el.reset.addEventListener('click', resetAll);
+
+  // Init
+  updateUI();
+  rafId = requestAnimationFrame(loop);
+
+  // Pause when hidden; resume if we were ticking
+  let wasTicking = false;
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+      wasTicking = ticking;
+      ticking = false;
+    } else if (wasTicking) {
+      ticking = true;
+    }
+  });
+})();
+</script>
+</body>
+</html>
